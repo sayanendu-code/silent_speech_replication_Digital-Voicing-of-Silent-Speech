@@ -19,25 +19,39 @@ import subprocess
 from pathlib import Path
 
 
-ZENODO_RECORD = "4064408"
-ZENODO_URL = f"https://zenodo.org/record/{ZENODO_RECORD}/files"
+ZENODO_RECORD = "4064409"  # concept DOI 4064408 resolves to this record
+# Zenodo new API download URL format
+ZENODO_URL = f"https://zenodo.org/api/records/{ZENODO_RECORD}/files"
 
 # Files in the Zenodo release (update if the dataset changes)
 DATASET_FILES = [
-    "silent_speech_data.tar.gz",
+    "emg_data.tar.gz",
 ]
 
 GITHUB_REPO = "https://github.com/dgaddy/silent_speech.git"
 
 
 def download_file(url: str, output_path: str):
-    """Download a file with wget (shows progress)."""
+    """Download a file using curl (macOS default) or urllib fallback."""
     print(f"Downloading {url}...")
-    subprocess.run(
-        ["wget", "-c", "--progress=bar:force:noscroll",
-         "-O", output_path, url],
-        check=True,
-    )
+
+    # Try curl first (available by default on macOS)
+    try:
+        subprocess.run(
+            ["curl", "-L", "--progress-bar", "-o", output_path, url],
+            check=True,
+        )
+        return
+    except FileNotFoundError:
+        pass  # curl not available, fall through to urllib
+
+    # Pure-Python fallback via urllib
+    import urllib.request
+    import shutil
+
+    print("  (using urllib fallback — no progress bar)")
+    with urllib.request.urlopen(url) as response, open(output_path, "wb") as out_file:
+        shutil.copyfileobj(response, out_file)
 
 
 def extract_archive(archive_path: str, output_dir: str):
@@ -133,7 +147,7 @@ def main():
     if not args.skip_download:
         # Download from Zenodo
         for filename in DATASET_FILES:
-            url = f"{ZENODO_URL}/{filename}"
+            url = f"{ZENODO_URL}/{filename}/content"
             output_path = os.path.join(args.output_dir, filename)
 
             if os.path.exists(output_path):

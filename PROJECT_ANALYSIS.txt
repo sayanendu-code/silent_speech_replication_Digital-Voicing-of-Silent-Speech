@@ -1,0 +1,667 @@
+# ══════════════════════════════════════════════════════════════════════
+#  DIGITAL VOICING OF SILENT SPEECH — COMPLETE PROJECT ANALYSIS
+#  Gaddy & Klein, UC Berkeley NLP Group
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  1. PUBLICATION TIMELINE & AUTHORS                                 │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  PAPER 1 ─ "Digital Voicing of Silent Speech"
+  ├── Venue:     EMNLP 2020 (★ Best Paper Award)
+  ├── Authors:   David Gaddy, Dan Klein
+  ├── Affil:     UC Berkeley, Computer Science
+  ├── PDF:       https://aclanthology.org/2020.emnlp-main.445.pdf
+  └── Cited:     335+ times (Google Scholar, as of 2025)
+
+  PAPER 2 ─ "An Improved Model for Voicing Silent Speech"
+  ├── Venue:     ACL-IJCNLP 2021 (Short Paper)
+  ├── Authors:   David Gaddy, Dan Klein
+  ├── PDF:       https://aclanthology.org/2021.acl-short.23.pdf
+  └── Key:       25.8% absolute WER improvement over Paper 1
+
+  PAPER 3 ─ "Voicing Silent Speech" (PhD Dissertation)
+  ├── Venue:     UC Berkeley EECS, PhD Thesis (May 2022)
+  ├── Author:    David Gaddy (Advisor: Dan Klein)
+  ├── PDF:       https://www2.eecs.berkeley.edu/Pubs/TechRpts/2022/EECS-2022-68.pdf
+  └── Key:       Final model, HiFi-GAN vocoder, silent speech recognition
+
+  AUTHOR STATUS:
+  └── David Gaddy is now at Google. This was his PhD thesis work.
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  2. THE DATASET — What you actually get from Zenodo                │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  Source:   https://doi.org/10.5281/zenodo.4064408
+            (concept DOI — resolves to record 4064409)
+  File:     emg_data.tar.gz  (~2 GB compressed)
+  Speaker:  Single male English speaker
+  Total:    ~18.6 hours of facial EMG
+
+  EXTRACTED DIRECTORY STRUCTURE:
+  ─────────────────────────────
+  emg_data/
+  ├── nonparallel_data/          ← vocalized EMG only (no silent pair)
+  │   ├── session_0/
+  │   │   ├── 0000_emg.npy      ← (N_samples, 8) float64 @ 1000 Hz
+  │   │   ├── 0000_audio.npy    ← (N_samples,) float64 @ 16 kHz
+  │   │   ├── 0001_emg.npy
+  │   │   ├── 0001_audio.npy
+  │   │   └── ...
+  │   ├── session_1/
+  │   └── ...
+  │
+  ├── silent_parallel_data/      ← silent EMG recordings
+  │   ├── session_0/
+  │   │   ├── 0000_emg.npy      ← mouthed silently, NO useful audio
+  │   │   └── ...
+  │   └── ...
+  │
+  ├── voiced_parallel_data/      ← vocalized EMG + audio (parallel to silent)
+  │   ├── session_0/
+  │   │   ├── 0000_emg.npy      ← spoken aloud
+  │   │   ├── 0000_audio.npy    ← recorded speech
+  │   │   └── ...
+  │   └── ...
+  │
+  └── (metadata files: info.json, prompts, etc.)
+
+  DATA BREAKDOWN:
+  ──────────────
+  Type                          Duration    Utterances   Words/Utt
+  ────────────────────────────  ──────────  ──────────   ─────────
+  Parallel Silent EMG (E_S)     3.6 hours     1,588        ~16
+  Parallel Vocalized EMG (E_V)  3.9 hours     1,588        ~16
+  Non-parallel Vocalized        11.2 hours    5,477        ~16
+  ────────────────────────────  ──────────  ──────────
+  TOTAL                         18.6 hours    7,065
+
+  Plus closed-vocabulary subset:
+    500 date/time utterances, 67-word vocab, ~4 words each
+    26 min silent + 30 min vocalized, single session
+
+  RAW SIGNAL FORMAT:
+  ──────────────────
+  EMG:   8 channels × 1000 Hz × float64
+         Each channel = 1 electrode on face/neck
+         Electrode positions: cheek (×3), chin, throat, jaw, near-nose, near-ear
+         Reference electrode behind left ear
+         Bias electrode behind right ear
+
+  Audio: 1 channel × 16,000 Hz × float64
+         Recorded from laptop microphone
+         Noise-reduced with spectral gating
+         Volume normalized across sessions
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  3. ARCHITECTURE EVOLUTION — Paper 1 → Paper 2 → Dissertation      │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 1: EMNLP 2020 — "Digital Voicing of Silent Speech"
+  ═══════════════════════════════════════════════════════════════════
+
+  INPUT FEATURES (hand-designed, 112-dim):
+  ─────────────────────────────────────────
+  Raw EMG (8ch × 1000Hz)
+       │
+       ▼
+  Butterworth HP filter (2 Hz) + Notch (60 Hz + harmonics)
+       │
+       ▼
+  Triangular split → x_low (< 134 Hz) + x_high (> 134 Hz)
+       │
+       ▼
+  Frame: 27ms window, 10ms stride → 100 Hz feature rate
+       │
+       ├── Time-domain features per channel (5):
+       │     mean(x_low²), mean(x_low), mean(x_high²), mean(|x_high|), ZCR(x_high)
+       │
+       └── STFT magnitude features per channel (9):
+             16-point FFT → 9 magnitude bins
+       │
+       ▼
+  Total: (5 + 9) × 8 channels = 112 features per frame
+
+  TRANSDUCER (trainable):
+  ───────────────────────
+  EMG features (B, T, 112)
+       │
+       ▼
+  [+ Session Embedding]  ← 32-dim per session, appended at every timestep
+       │                    (B, T, 144)
+       ▼
+  Dropout(0.5)           ← TRAINABLE: nothing, just regularization
+       │
+       ▼
+  BiLSTM Layer 1         ← TRAINABLE: 4 × 1024 × (1024+144) + 4 × 1024 × 1024
+       │                    = ~8.8M params (forward) + same (backward)
+       ▼
+  Dropout(0.5)
+       │
+       ▼
+  BiLSTM Layer 2         ← TRAINABLE: 4 × 1024 × (2048+1024) × 2
+       │                    ~25M params
+       ▼
+  Dropout(0.5)
+       │
+       ▼
+  BiLSTM Layer 3         ← TRAINABLE: same as layer 2
+       │                    ~25M params
+       ▼
+  Dropout(0.5)
+       │
+       ▼
+  Linear(2048 → 26)      ← TRAINABLE: 2048 × 26 + 26 = ~53K params
+       │
+       ▼
+  Predicted MFCCs (B, T, 26) @ 100 Hz
+
+  TOTAL TRANSDUCER PARAMS: ~60-70M (estimate)
+
+  VOCODER (WaveNet, separately trained):
+  ───────────────────────────────────────
+  Gold/Predicted MFCCs (T, 26) @ 100 Hz
+       │
+       ▼
+  BiLSTM(512, bidirectional)   ← TRAINABLE: conditioning network
+       │
+       ▼
+  Linear(1024 → 128)           ← TRAINABLE
+       │
+       ▼
+  ConvTranspose1d(upsample)    ← 100 Hz → 16,000 Hz (factor 160)
+       │
+       ▼
+  WaveNet Core                 ← TRAINABLE:
+       │  16 dilated causal conv layers
+       │  max dilation: 128
+       │  residual channels: 64
+       │  skip channels: 256
+       │  gated activation + conditioning
+       ▼
+  Softmax(256)                 ← μ-law quantized output
+       │
+       ▼
+  Audio waveform @ 16 kHz
+
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 2: ACL 2021 — "An Improved Model for Voicing Silent Speech"
+  ═══════════════════════════════════════════════════════════════════
+
+  WHAT CHANGED (3 key modifications):
+  ────────────────────────────────────
+
+  CHANGE 1 — Input: Hand-designed features → Learned Conv features
+  ┌──────────────────────────────────────────────────────────────┐
+  │  BEFORE (Paper 1):                                          │
+  │    EMG → filter → 112-dim hand-designed features @ 100 Hz   │
+  │                                                              │
+  │  AFTER (Paper 2):                                           │
+  │    Raw EMG (8ch × 1000 Hz)                                  │
+  │         │                                                    │
+  │         ▼  only: HP 2Hz + notch 60Hz + resample 800Hz       │
+  │         │   + magnitude /10                                  │
+  │         ▼                                                    │
+  │    ResConvBlock 1 (768ch, stride 2) → 400 Hz                │
+  │         ▼                                                    │
+  │    ResConvBlock 2 (768ch, stride 2) → 200 Hz                │
+  │         ▼                                                    │
+  │    ResConvBlock 3 (768ch, stride 2) → 100 Hz                │
+  │         ▼                                                    │
+  │    [+ Session Embed 32→768, added per timestep]              │
+  │         ▼                                                    │
+  │    Learned features (B, T, 768) @ 100 Hz                    │
+  │                                                              │
+  │  Each ResConvBlock:                                         │
+  │    input → Conv1d(k=3) → BatchNorm → ReLU                  │
+  │         → Conv1d(k=3) → BatchNorm → [+ shortcut] → ReLU    │
+  │    shortcut: Conv1d(k=1, stride=2) for downsampling         │
+  └──────────────────────────────────────────────────────────────┘
+
+  CHANGE 2 — Backbone: BiLSTM(1024×3) → Transformer(768, 6 layers)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  BEFORE (Paper 1):                                          │
+  │    3× BiLSTM, 1024 hidden, dropout 0.5                      │
+  │                                                              │
+  │  AFTER (Paper 2):                                           │
+  │    6× Transformer encoder layers                             │
+  │      - model dim: 768                                       │
+  │      - heads: 8                                              │
+  │      - FFN dim: 3072                                        │
+  │      - dropout: 0.1                                          │
+  │      - RELATIVE position embeddings (not absolute)           │
+  │      - k=100 (1 second window each direction)               │
+  │      - attention beyond k is zeroed out                      │
+  └──────────────────────────────────────────────────────────────┘
+
+  CHANGE 3 — Loss: Pure MSE → MSE + Auxiliary Phoneme CTC loss
+  ┌──────────────────────────────────────────────────────────────┐
+  │  BEFORE (Paper 1):                                          │
+  │    Loss = MSE(predicted_mfcc, target_mfcc)                  │
+  │                                                              │
+  │  AFTER (Paper 2):                                           │
+  │    Additional linear head on top of Transformer:             │
+  │      → Linear(768 → n_phonemes) → Softmax                  │
+  │                                                              │
+  │    Combined cost for alignment:                              │
+  │      δ'[i,j] = ||A_V[i] - Â_S[j]||² − λ·P_V[i]ᵀ·log(P̂_S[j]) │
+  │      λ = 0.1                                                │
+  │                                                              │
+  │    Phoneme labels from Montreal Forced Aligner               │
+  │    Phoneme head is DISCARDED after training                  │
+  └──────────────────────────────────────────────────────────────┘
+
+  OTHER CHANGES (Paper 2):
+    - Optimizer: Adam → AdamW (weight decay 1e-7)
+    - LR warmup: 500 batches linear warmup to 1e-3
+    - Epochs: up to 200 → fixed 80
+    - Batching: concatenate-and-reshape (2s chunks, 256s per batch)
+    - Alignment: simplified to predicted-audio only (no separate CCA step)
+    - Vocoder: same WaveNet (unchanged)
+
+
+  ═══════════════════════════════════════════════════════════════════
+  DISSERTATION 2022 — "Voicing Silent Speech" (Final Model)
+  ═══════════════════════════════════════════════════════════════════
+
+  WHAT CHANGED FROM PAPER 2:
+  ──────────────────────────
+
+  CHANGE — Vocoder: WaveNet → HiFi-GAN
+  ┌──────────────────────────────────────────────────────────────┐
+  │  BEFORE (Papers 1 & 2):                                     │
+  │    WaveNet: autoregressive, sample-by-sample                │
+  │    VERY slow inference (minutes per utterance)               │
+  │                                                              │
+  │  AFTER (Dissertation):                                      │
+  │    HiFi-GAN: feed-forward GAN-based vocoder                │
+  │    Fine-tuned from UNIVERSAL_V1 pretrained model            │
+  │    Fine-tuned for 75,000 steps                               │
+  │    Input: predicted spectrograms (not gold)                  │
+  │    FAST inference (real-time or faster)                      │
+  │                                                              │
+  │  Result: better audio quality + massively faster synthesis   │
+  └──────────────────────────────────────────────────────────────┘
+
+  ADDITION — Silent Speech Recognition (direct EMG → text)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Same Conv + Transformer transducer architecture             │
+  │  BUT: output head replaced with CTC decoder                 │
+  │    → predicts character sequence directly                    │
+  │    → no vocoder needed                                      │
+  │    → KenLM language model for decoding                      │
+  │  WER: ~28% (open vocabulary, text output)                   │
+  └──────────────────────────────────────────────────────────────┘
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  4. DATA FLOW DURING TRAINING                                      │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 1 TRAINING (what we replicated):
+  ═══════════════════════════════════════════════════════════════════
+
+  PHASE 1 — Initial Alignment (before training starts)
+  ─────────────────────────────────────────────────────
+
+  For each parallel utterance (E_S, E_V, A_V):
+
+    Silent EMG ──────────► extract 112-dim features ──► E'_S (M, 112)
+    Vocalized EMG ───────► extract 112-dim features ──► E'_V (N, 112)
+    Vocalized Audio ─────► extract 26 MFCCs ──────────► A'_V (N, 26)
+
+    E'_S and E'_V ───────► DTW (Euclidean distance)
+         │                      │
+         ▼                      ▼
+    alignment[i] → j        (which frame in E'_V matches frame i in E'_S)
+         │
+         ▼
+    Warped targets:  Ã'_S[i] = A'_V[ alignment[i] ]
+                     Now we have (E'_S, Ã'_S) pairs!
+
+  PHASE 2 — CCA Refinement (still before training)
+  ─────────────────────────────────────────────────
+
+    Collect ALL aligned pairs from Phase 1:
+      (E'_S[aligned], E'_V[warped]) across entire dataset
+         │
+         ▼
+    Fit CCA (15 components):
+      Learn projections P_S and P_V
+      that maximize correlation between silent & vocalized EMG
+         │
+         ▼
+    Re-run DTW with CCA-projected distance:
+      δ_CCA[i,j] = ||P_S · E'_S[i] − P_V · E'_V[j]||
+         │
+         ▼
+    Updated warped targets: Ã'_S (better aligned)
+
+  PHASE 3 — Training Loop (per epoch)
+  ────────────────────────────────────
+
+    ┌────────────────────────────────────────────────────────────┐
+    │  TRAINING BATCH (mixed from 3 sources):                   │
+    │                                                            │
+    │  Source A: (E'_S, Ã'_S, session_silent)                   │
+    │    ← silent EMG + warped audio targets                     │
+    │                                                            │
+    │  Source B: (E'_V, A'_V, session_vocalized)                │
+    │    ← vocalized parallel EMG + real audio                   │
+    │                                                            │
+    │  Source C: (E'_V, A'_V, session_nonparallel)              │
+    │    ← non-parallel vocalized EMG + real audio               │
+    │                                                            │
+    │  All mixed in each batch, differentiated by session IDs    │
+    └────────────────────────────────────────────────────────────┘
+              │
+              ▼
+    Transducer:  EMG + SessionEmbed → BiLSTM×3 → Linear → Â'
+              │
+              ▼
+    Loss = MSE(Â', target)     ← target is Ã'_S or A'_V
+              │
+              ▼
+    Adam optimizer, lr=0.001, halved every 5 epochs no improvement
+              │
+              ▼
+    Validation loss on silent EMG test → checkpoint best model
+
+  PHASE 4 — Predicted Audio Re-alignment (epoch 5+, every 5 epochs)
+  ──────────────────────────────────────────────────────────────────
+
+    Partially-trained transducer
+         │
+         ▼
+    Run inference on all silent EMG → get predicted MFCCs Â'_S
+         │
+         ▼
+    New DTW cost:
+      δ_full[i,j] = δ_CCA[i,j] + 10 · ||Â'_S[i] − A'_V[j]||
+                                   ↑ λ=10
+         │
+         ▼
+    Re-compute ALL alignments → new warped targets Ã'_S
+         │
+         ▼
+    Continue training with updated targets
+
+  WAVENET TRAINING (separate):
+  ────────────────────────────
+
+    Gold vocalized audio (16kHz) + Gold MFCCs (26-dim, 100Hz)
+         │
+         ▼
+    Teacher forcing:
+      Input:  gold audio shifted by 1 sample
+      Target: μ-law quantized next sample (256 classes)
+      Conditioning: gold MFCCs (upsampled to 16kHz)
+         │
+         ▼
+    Cross-entropy loss, batch_size=1 (memory constraints)
+         │
+         ▼
+    NOT trained on predicted MFCCs → avoids error compounding
+
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 2 TRAINING (simplified alignment):
+  ═══════════════════════════════════════════════════════════════════
+
+  Key difference: NO separate CCA step. Alignment uses predicted audio only.
+
+    For silent utterances:
+      Run transducer → Â'_S
+      DTW cost: δ[i,j] = ||A_V[i] − Â'_S[j]||²
+      (note: alignment goes in opposite direction — A_V is s1, Â_S is s2)
+
+    For vocalized utterances:
+      Direct MSE loss (time-aligned, no DTW needed)
+
+    Batching: concatenate all EMG in batch → reshape to 2-second chunks
+      This acts as "context dropout" — slicing removes nearby frames
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  5. DATA FLOW AFTER TRAINING (INFERENCE)                           │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  User silently mouths words with EMG electrodes on face
+       │
+       ▼
+  Raw EMG signal: 8 channels × 1000 Hz
+       │
+       ▼
+  ┌─ PREPROCESSING ─────────────────────────────────────┐
+  │  Paper 1: HP filter → notch → hand-designed 112-dim │
+  │  Paper 2: HP filter → notch → resample 800Hz → /10  │
+  └──────────────────────────────────────────────────────┘
+       │
+       ▼
+  ┌─ TRANSDUCER (trained model) ────────────────────────┐
+  │  Paper 1: features → BiLSTM×3 → Linear → 26 MFCCs  │
+  │  Paper 2: raw → Conv×3 → Transformer×6 → 26 MFCCs  │
+  └──────────────────────────────────────────────────────┘
+       │
+       ▼
+  Predicted MFCCs: (T, 26) @ 100 Hz
+       │
+       ├──── VOICING PATH (EMG → Speech) ────────────────┐
+       │                                                   │
+       ▼                                                   │
+  ┌─ VOCODER ──────────────────────────────┐              │
+  │  Paper 1+2: WaveNet (slow, sample-by-sample)         │
+  │  Dissertation: HiFi-GAN (fast, feed-forward)         │
+  └────────────────────────────────────────┘              │
+       │                                                   │
+       ▼                                                   │
+  Audio waveform @ 16 kHz  ← 🔊 audible speech           │
+                                                           │
+       ├──── RECOGNITION PATH (EMG → Text, Dissertation) ─┘
+       │
+       ▼
+  ┌─ CTC DECODER ─────────────────────────┐
+  │  Linear → characters                   │
+  │  + KenLM language model                │
+  │  → decoded text                        │
+  └────────────────────────────────────────┘
+       │
+       ▼
+  Transcribed text  ← 📝 "it is possible that the infusoria..."
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  6. ACCURACY PROGRESSION — COMPLETE WER TABLE                      │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  ═══════════════════════════════════════════════════════════════════
+  OPEN VOCABULARY — EMG → Speech (voicing task)
+  ═══════════════════════════════════════════════════════════════════
+
+  Model / Paper               ASR WER    Human WER    Eval Method
+  ──────────────────────────  ─────────  ──────────   ────────────
+  Direct transfer baseline     88.0%       95.1%      DeepSpeech 0.7
+  (vocalized-only, no throat)
+
+  Paper 1 (EMNLP 2020)        68.0%       74.8%      DeepSpeech 0.7
+  BiLSTM + WaveNet
+
+  Paper 1 — no CCA            69.8%         —        DeepSpeech 0.7
+  Paper 1 — no audio align    76.5%         —        DeepSpeech 0.7
+
+  Paper 2 (ACL 2021)          42.2%       32.3%      DeepSpeech 0.7
+  Conv+Transformer+WaveNet     (avg of 36.1% and 28.5% from 2 humans)
+
+  Paper 2 — hand features     45.2%         —        DeepSpeech 0.7
+  Paper 2 — LSTM not TF       46.0%         —        DeepSpeech 0.7
+  Paper 2 — no phoneme loss   51.7%         —        DeepSpeech 0.7
+
+  Dissertation (2022 repo)     ~36%          —        DeepSpeech 0.7
+  Conv+Transformer+HiFi-GAN
+
+  Oracle (real vocalized audio) 9.5%         —        DeepSpeech 0.7
+
+  ═══════════════════════════════════════════════════════════════════
+  OPEN VOCABULARY — EMG → Text (recognition task, Dissertation only)
+  ═══════════════════════════════════════════════════════════════════
+
+  Model                        WER
+  ──────────────────────────  ─────
+  Dissertation CTC model       ~28%       (same architecture + CTC decoder)
+  Benster et al. 2024          ~30%       (reproduced baseline)
+
+  ═══════════════════════════════════════════════════════════════════
+  CLOSED VOCABULARY — Date/Time expressions (Paper 1 only)
+  ═══════════════════════════════════════════════════════════════════
+
+  Model                        Human WER
+  ──────────────────────────  ──────────
+  Direct transfer baseline     88.8%
+  Without throat electrode     64.6%
+  Paper 1 full model            3.6%      ← nearly perfect!
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  7. WHAT MADE EACH IMPROVEMENT WORK — Ablation Summary             │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  PAPER 1 → PAPER 2 (68.0% → 42.2% = 25.8% absolute improvement):
+  ─────────────────────────────────────────────────────────────────
+
+  Improvement                  Isolated WER   Contribution
+  ──────────────────────────  ────────────   ─────────────
+  Learned conv features         45.2%         −3.0% vs full (explains 12%)
+  Transformer (vs LSTM)         46.0%         −3.8% vs full (explains 15%)
+  Phoneme auxiliary loss        51.7%         −9.5% vs full (explains 37%)
+  All three combined            42.2%         full model
+
+  The phoneme loss was the single biggest contributor.
+  It provides the model with supervision about WHAT sounds are being
+  produced, not just what they sound like acoustically.
+
+  PAPER 2 → DISSERTATION (42.2% → ~36% = ~6% improvement):
+  ──────────────────────────────────────────────────────────
+
+  Primary change: WaveNet → HiFi-GAN
+    - Better audio quality (GAN training produces more natural speech)
+    - Faster inference (real-time vs minutes per utterance)
+    - Fine-tuned on PREDICTED spectrograms (adapts to model errors)
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  8. TRAINABLE PARAMETERS — Where the learning happens              │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 1 — WHAT IS TRAINABLE vs FIXED
+  ═══════════════════════════════════════════════════════════════════
+
+  Component               Trainable?   Parameters   Notes
+  ──────────────────────  ──────────   ──────────   ─────────────────────
+  EMG filtering           FIXED        0            Butterworth + notch
+  Feature extraction      FIXED        0            Hand-designed formulas
+  Session embeddings      TRAINABLE    ~1K each     32-dim per session
+  BiLSTM (3 layers)       TRAINABLE    ~60M         Main transducer
+  Linear projection       TRAINABLE    ~53K         2048→26
+  WaveNet conditioning    TRAINABLE    ~2M          BiLSTM(512) + Linear
+  WaveNet core            TRAINABLE    ~5-10M       16 dilated conv layers
+  DTW alignment           FIXED        0            Dynamic programming
+  CCA projections         FIT ONCE     ~112×15×2    Fitted, not gradient
+
+  ═══════════════════════════════════════════════════════════════════
+  PAPER 2 — WHAT IS TRAINABLE vs FIXED
+  ═══════════════════════════════════════════════════════════════════
+
+  Component               Trainable?   Parameters   Notes
+  ──────────────────────  ──────────   ──────────   ─────────────────────
+  EMG filtering           FIXED        0            HP + notch + resample
+  Conv feature blocks     TRAINABLE    ~15M         3× ResConvBlock(768)
+  Session embeddings      TRAINABLE    ~25K         32→768 per session
+  Transformer layers      TRAINABLE    ~35M         6 layers, 768dim, 8 heads
+  Relative pos embeds     TRAINABLE    ~150K        k=100 each direction
+  MFCC linear head        TRAINABLE    ~20K         768→26
+  Phoneme linear head     TRAINABLE    ~30K         768→~40 (discarded!)
+  WaveNet                 TRAINABLE    ~5-10M       Same as Paper 1
+
+  TOTAL TRANSDUCER: ~50M params (similar scale, different distribution)
+
+  ═══════════════════════════════════════════════════════════════════
+  DISSERTATION — WHAT IS TRAINABLE vs FIXED
+  ═══════════════════════════════════════════════════════════════════
+
+  Same transducer as Paper 2 (~50M)
+  + HiFi-GAN vocoder (~14M, fine-tuned from UNIVERSAL_V1 pretrained)
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  9. CURRENT REPO STATE vs OUR REPLICATION                          │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  Feature                  Original Repo (current)        Our Replication
+  ──────────────────────  ─────────────────────────────  ──────────────────
+  Architecture             Conv+Transformer (Paper 2/3)   BiLSTM (Paper 1)
+  Input features           Learned from raw EMG           Hand-designed 112d
+  Vocoder                  HiFi-GAN                       WaveNet
+  Phoneme aux loss         Yes (λ=0.1)                    No
+  Alignment                Predicted-audio DTW only       DTW + CCA + audio
+  Optimizer                AdamW + warmup                 Adam
+  Batching                 Concat-reshape (2s chunks)     Standard padding
+  Expected WER             ~36%                           ~68%
+  Evaluation ASR           DeepSpeech 0.7                 Whisper / DeepSpeech
+  Text recognition         Yes (CTC, ~28% WER)            No
+  Pre-trained available    Yes (Zenodo 6747411)           Train from scratch
+
+  TO REACH CURRENT BEST (~36% WER), you would need to:
+    1. Replace BiLSTM with Transformer + relative position embeddings
+    2. Replace hand-designed features with learned Conv blocks
+    3. Add phoneme auxiliary loss (requires Montreal Forced Aligner)
+    4. Replace WaveNet with HiFi-GAN
+    5. Use AdamW with warmup schedule
+    6. Use concat-reshape batching strategy
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  10. KEY DEPENDENCIES & TOOLS USED                                 │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  Tool                    Used For                        Paper
+  ──────────────────────  ─────────────────────────────   ─────
+  OpenBCI Cyton Board     EMG recording hardware          All
+  Ten20 electrode paste   Conductive paste for electrodes All
+  Gold-plated electrodes  8 facial + 2 reference          All
+  noisereduce (Python)    Spectral gating on audio        All
+  Mozilla DeepSpeech 0.7  ASR evaluation (WER baseline)   All
+  Montreal Forced Aligner Phoneme labels for aux loss     2, 3
+  HiFi-GAN               Vocoder (UNIVERSAL_V1 base)     3
+  NVIDIA nv-wavenet       GPU WaveNet inference           1, 2
+  ctcdecode               CTC beam search decoding        3
+  KenLM                   Language model for recognition  3
+
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │  11. SUMMARY — THE BIG PICTURE                                     │
+# └─────────────────────────────────────────────────────────────────────┘
+
+  2020: "Can we voice silent speech at all?"
+        → Yes! 3.6% WER on closed vocab, 68% on open vocab.
+        → Key insight: transfer audio targets from vocalized to silent.
+
+  2021: "Can we make it actually intelligible in open vocabulary?"
+        → 42.2% WER — huge jump from learned features + Transformer + phonemes.
+        → Key insight: let the model learn its own features from raw EMG.
+
+  2022: "Can we make it practical and also do recognition?"
+        → 36% WER voicing, 28% WER recognition.
+        → Key insight: HiFi-GAN makes real-time synthesis possible.
+
+  The fundamental challenge remains: silent EMG signals are qualitatively
+  different from vocalized EMG (no vocal fold vibration, different
+  articulation patterns to suppress sound). This domain gap is why
+  the alignment/transfer machinery exists at all.
