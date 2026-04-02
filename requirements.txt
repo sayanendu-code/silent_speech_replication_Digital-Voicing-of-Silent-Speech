@@ -1,0 +1,23 @@
+# Core
+numpy>=1.21.0
+scipy>=1.7.0
+torch>=1.12.0
+torchaudio>=0.12.0
+
+# Audio
+librosa>=0.9.0
+soundfile>=0.10.0
+
+# ML utilities
+scikit-learn>=1.0.0     # CCA
+numba>=0.56.0           # JIT for DTW
+
+# Evaluation
+# openai-whisper>=20230314  # Uncomment for Whisper ASR
+# deepspeech>=0.9.3         # Uncomment for DeepSpeech ASR
+
+# Testing
+pytest>=7.0.0
+
+# Utilities
+tqdm>=4.64.0
