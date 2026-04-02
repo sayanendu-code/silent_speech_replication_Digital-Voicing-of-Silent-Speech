@@ -309,9 +309,142 @@ def main(args):
     print(f"\nTraining complete. Best val loss: {best_val_loss:.6f}")
 
 
+def finetune_closed_vocab(args):
+    """
+    Section 4.1: "All three models were trained on open vocabulary data
+    before being fine-tuned on the closed vocabulary training set."
+
+    Loads the best open-vocab transducer checkpoint and fine-tunes on
+    the 370-utterance closed-vocab training set.
+    """
+    cfg = FullConfig()
+    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    print("="*60)
+    print("  CLOSED-VOCAB FINE-TUNING")
+    print("="*60)
+
+    # Load processed data
+    data = load_processed(os.path.join(args.data_dir, 'processed_data.pkl'))
+    closed_vocab = data.get('closed_vocab', [])
+    if not closed_vocab:
+        print("ERROR: No closed-vocab data found in processed_data.pkl.")
+        print("Re-run preprocessing with a dataset that includes closed_vocab/.")
+        return
+
+    n_sessions = data.get('n_sessions', len(data.get('session_map', {})))
+    cfg.n_sessions = n_sessions
+
+    # Split: 370 train, 30 val, 100 test (Section 2.1)
+    from data.preprocessing import split_data
+    cv_train, cv_val, cv_test = split_data(
+        closed_vocab,
+        n_val=cfg.train.cv_val,     # 30
+        n_test=cfg.train.cv_test,   # 100
+        seed=cfg.train.seed,
+    )
+    print(f"  Closed-vocab: {len(cv_train)} train, {len(cv_val)} val, {len(cv_test)} test")
+
+    # Load open-vocab checkpoint
+    ov_ckpt_path = os.path.join(cfg.paths.checkpoint_dir, 'best_transducer.pt')
+    if not os.path.exists(ov_ckpt_path):
+        print(f"ERROR: No open-vocab checkpoint at {ov_ckpt_path}")
+        print("Train open-vocab first: python train_transducer.py --data_dir ./data/processed")
+        return
+
+    print(f"  Loading open-vocab checkpoint: {ov_ckpt_path}")
+    ckpt = torch.load(ov_ckpt_path, map_location=device)
+    model = EMGTransducer(cfg.transducer, n_sessions=n_sessions).to(device)
+    model.load_state_dict(ckpt['model_state'])
+
+    # Build alignment + targets for closed-vocab
+    transfer = TargetTransfer(
+        cca_n_components=cfg.alignment.cca_n_components,
+        lambda_audio=cfg.alignment.lambda_audio,
+    )
+    silent_targets = prepare_alignment_targets(cv_train, transfer, epoch=0, device=device)
+
+    # Build datasets
+    from data.dataset import EMGSpeechDataset, build_dataloader
+    train_ds = EMGSpeechDataset(
+        emg_features=[item['silent_emg'] for item in cv_train],
+        audio_features=silent_targets,
+        session_ids=[item['session'] for item in cv_train],
+        texts=[item['text'] for item in cv_train],
+    )
+    # Also include vocalized closed-vocab for training
+    from data.dataset import CombinedDataset
+    vocalized_ds = EMGSpeechDataset(
+        emg_features=[item['vocalized_emg'] for item in cv_train],
+        audio_features=[item['vocalized_audio'] for item in cv_train],
+        session_ids=[item['session'] for item in cv_train],
+        texts=[item['text'] for item in cv_train],
+    )
+    combined_ds = CombinedDataset(train_ds, vocalized_ds)
+
+    train_loader = build_dataloader(combined_ds, batch_size=cfg.train.batch_size, shuffle=True)
+
+    # Validation on silent
+    val_targets = transfer.generate_targets(
+        [item['vocalized_audio'] for item in cv_val],
+        transfer.initial_alignment(
+            [item['silent_emg'] for item in cv_val],
+            [item['vocalized_emg'] for item in cv_val],
+        )
+    )
+    val_ds = EMGSpeechDataset(
+        emg_features=[item['silent_emg'] for item in cv_val],
+        audio_features=val_targets,
+        session_ids=[item['session'] for item in cv_val],
+    )
+    val_loader = build_dataloader(val_ds, batch_size=cfg.train.batch_size, shuffle=False)
+
+    # Fine-tune with lower LR
+    optimizer = Adam(model.parameters(), lr=cfg.train.initial_lr * 0.1)  # 0.0001
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    max_epochs = 100
+
+    for epoch in range(max_epochs):
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_loss = validate(model, val_loader, device)
+        scheduler.step(val_loss)
+
+        elapsed = time.time() - t0
+        print(f"CV Epoch {epoch+1:3d} | Train: {train_loss:.6f} | Val: {val_loss:.6f} | {elapsed:.1f}s")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state': model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'config': cfg,
+            }, os.path.join(cfg.paths.checkpoint_dir, 'best_transducer_closed_vocab.pt'))
+            print(f"  ✓ New best closed-vocab model (val_loss={val_loss:.6f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= 10:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+
+    print(f"\nClosed-vocab fine-tuning complete. Best val loss: {best_val_loss:.6f}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train EMG-to-Speech Transducer')
     parser.add_argument('--data_dir', type=str, default='./data/processed')
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--closed_vocab', action='store_true',
+                        help='Fine-tune on closed-vocab data (requires open-vocab checkpoint)')
     args = parser.parse_args()
-    main(args)
+
+    if args.closed_vocab:
+        finetune_closed_vocab(args)
+    else:
+        main(args)
