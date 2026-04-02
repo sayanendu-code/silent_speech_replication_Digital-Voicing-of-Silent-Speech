@@ -1,247 +1,359 @@
-# Digital Voicing of Silent Speech — Full Replication
+# Digital Voicing of Silent Speech — Paper 1 Replication
 
-A complete, modular reimplementation of **Gaddy & Klein (2020)**: *"Digital Voicing of Silent Speech"* (EMNLP 2020).
-
-> **Paper**: [https://nlp.cs.berkeley.edu/pubs/Gaddy-Klein_2020_DigitalVoicing_paper.pdf](https://nlp.cs.berkeley.edu/pubs/Gaddy-Klein_2020_DigitalVoicing_paper.pdf)  
-> **Original code**: [https://github.com/dgaddy/silent_speech](https://github.com/dgaddy/silent_speech)  
-> **Dataset**: [https://doi.org/10.5281/zenodo.4064408](https://doi.org/10.5281/zenodo.4064408)
+> **Paper**: Gaddy & Klein, EMNLP 2020 (★ Best Paper Award)
+> **PDF**: https://aclanthology.org/2020.emnlp-main.445.pdf
+> **Dataset**: https://doi.org/10.5281/zenodo.4064408
+> **Target WER**: 68.0% (open vocab) / 3.6% (closed vocab)
 
 ---
 
-## Architecture Overview
+## The Task
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    TRAINING PIPELINE                            │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────────────────────────┐          │
-│  │ Silent   │    │   Audio Target Transfer (§3.2)    │          │
-│  │ EMG  E_S │───▶│  DTW → CCA → Predicted Audio    │──▶ Ã'_S  │
-│  └──────────┘    │  alignment refinement            │          │
-│  ┌──────────┐    └──────────────────────────────────┘          │
-│  │ Vocal    │───────────────────────────────────────────▶ A'_V  │
-│  │ EMG  E_V │                                                   │
-│  └──────────┘                                                   │
-│  ┌──────────┐                                                   │
-│  │ Vocal    │──▶ MFCCs ──▶ WaveNet Training                    │
-│  │ Audio A_V│                                                   │
-│  └──────────┘                                                   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────┐               │
-│  │        BiLSTM Transducer (§3.1)             │               │
-│  │  E' + SessionEmbed → BiLSTM×3 → Linear → Â' │               │
-│  │  Loss: MSE(Â', Ã'_S)  +  MSE(Â', A'_V)     │               │
-│  └─────────────────────────────────────────────┘               │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    INFERENCE PIPELINE                            │
-│                                                                 │
-│  Silent EMG                                                     │
-│      │                                                          │
-│      ▼                                                          │
-│  Filter + Extract Features (112-dim @ 100Hz)                    │
-│      │                                                          │
-│      ▼                                                          │
-│  BiLSTM Transducer → Predicted MFCCs (26-dim @ 100Hz)          │
-│      │                                                          │
-│      ▼                                                          │
-│  WaveNet Decoder → Audio Waveform (16 kHz)                      │
-│      │                                                          │
-│      ▼                                                          │
-│  🔊 Synthesized Speech                                          │
-└─────────────────────────────────────────────────────────────────┘
+Person silently mouths words → EMG electrodes capture muscle signals → Model → Audible speech
 ```
 
 ---
 
-## Project Structure
+## Hardware Setup
 
 ```
-silent_speech/
-├── config.py                    # All hyperparameters (§3.1, §3.3, App A)
-│
-├── features/
-│   ├── emg_features.py          # EMG filtering + 112-dim extraction (§2.3, §3.1)
-│   └── audio_features.py        # 26 MFCCs + μ-law encoding (§3.1, §3.3)
-│
-├── alignment/
-│   ├── dtw.py                   # Dynamic Time Warping (§3.2)
-│   ├── cca.py                   # Canonical Correlation Analysis (§3.2.1)
-│   └── target_transfer.py       # Full 3-phase alignment pipeline (§3.2)
-│
-├── models/
-│   ├── transducer.py            # 3-layer BiLSTM + session embedding (§3.1)
-│   └── wavenet.py               # WaveNet + conditioning network (§3.3, App A)
-│
-├── data/
-│   ├── dataset.py               # PyTorch datasets + combined loader (§2)
-│   └── preprocessing.py         # Raw → normalized features pipeline (§2.3)
-│
-├── utils/
-│   ├── helpers.py               # Logging, checkpointing, reproducibility
-│   └── evaluation.py            # WER computation + ASR backends (§4)
-│
-├── train_transducer.py          # Transducer training with re-alignment (§3.1-3.2)
-├── train_wavenet.py             # WaveNet training, batch_size=1 (§3.3)
-├── inference.py                 # End-to-end EMG → audio pipeline (§4)
-├── evaluate.py                  # Standalone WER evaluation
-├── download_data.py             # Dataset download from Zenodo
-├── main.py                      # Unified CLI entry point
-├── requirements.txt
-└── tests/
-    └── test_all.py              # Unit + integration tests
+                    ┌──────────────────────────────────┐
+                    │         HUMAN FACE                │
+                    │                                    │
+                    │    [7]●          ●[8]              │
+                    │        nose area   back cheek      │
+                    │                                    │
+                    │  [1]●    mouth    ●[6]             │
+                    │   left cheek      right cheek      │
+                    │                                    │
+                    │       [2]●   chin                  │
+                    │                                    │
+                    │       [3]●   below chin            │
+                    │                                    │
+                    │   [5]●           jaw               │
+                    │                                    │
+                    │       [4]●   throat                │
+                    │        (near Adam's apple)         │
+                    │                                    │
+                    │  [ref]●              ●[bias]       │
+                    │  behind              behind        │
+                    │  left ear            right ear     │
+                    └──────────────────────────────────┘
+
+  8 active electrodes + 1 reference + 1 bias
+  Gold-plated electrodes with Ten20 conductive paste
+  OpenBCI Cyton board, WiFi, 1000 Hz per channel
 ```
+
+---
+
+## The Dataset
+
+```
+  emg_data/   (18.6 hours total, single male English speaker)
+  │
+  ├── silent_parallel_data/          3.6h, 7 sessions, ~2188 utterances
+  │   Speaker mouths words WITHOUT producing sound.
+  │
+  ├── voiced_parallel_data/          3.9h, 7 sessions, ~2068 utterances
+  │   SAME utterances spoken aloud. EMG + audio simultaneously.
+  │
+  ├── nonparallel_data/              11.2h, 10 sessions, ~6833 utterances
+  │   Vocalized speech only. No silent counterpart.
+  │
+  └── closed_vocab/                  ~1h, 500 date/time utterances
+      Only 67 unique words. For the 3.6% WER experiment.
+
+  Per utterance:
+    {id}_emg.npy             (N, 8)    float64 @ 1000 Hz
+    {id}_audio_clean.flac    (M,)      float64 @ 16,000 Hz
+    {id}_info.json           {"text": "...", "book": "...", ...}
+```
+
+---
+
+## Complete Architecture — End to End
+
+```
+═══════════════════════════════════════════════════════════════════════
+ RAW INPUT                    PREPROCESSING               FEATURE SPACE
+═══════════════════════════════════════════════════════════════════════
+
+ 8 electrodes                Butterworth HP 2Hz           112 dimensions
+ 1000 Hz each                Notch 60Hz+harmonics         100 Hz
+ ~3 seconds                  Zero phase delay             ~300 frames
+
+ ┌─────────────────┐         ┌──────────────┐            ┌──────────────┐
+ │ ch1: ∿∿∿∿∿∿∿∿∿  │ filter  │ ch1: ∿∿∿∿∿∿  │  extract   │ frame 0:     │
+ │ ch2: ∿∿∿∿∿∿∿∿∿  │───────► │ ch2: ∿∿∿∿∿∿  │──────────► │  [112 vals]  │
+ │ ...              │ remove  │ ...            │  27ms win  │ frame 1:     │
+ │ ch8: ∿∿∿∿∿∿∿∿∿  │ noise   │ ch8: ∿∿∿∿∿∿  │  10ms hop  │  [112 vals]  │
+ └─────────────────┘         └──────────────┘            │ ...          │
+  (3000, 8)                   (3000, 8)                   │ frame 299:   │
+                                                          │  [112 vals]  │
+                                                          └──────────────┘
+                                                           (300, 112)
+```
+
+---
+
+## Feature Extraction — What those 112 dimensions are
+
+```
+  For EACH of 8 channels, for EACH 27ms frame:
+
+  Raw channel signal (27 samples)
+       │
+       ├───────────────────────────────────────┐
+       │                                       │
+       ▼                                       ▼
+  Triangular lowpass at 134 Hz           16-point STFT
+       │                                       │
+       ├──► x_low  (< 134 Hz)                 ▼
+       │       │                          magnitude of
+       │       ├──► mean(x_low²)    ◄1    9 freq bins
+       │       └──► mean(x_low)     ◄2         │
+       │                                       ├──► bin 0  ◄6
+       └──► x_high (> 134 Hz)                 ├──► bin 1  ◄7
+               │                               ├──► bin 2  ◄8
+               ├──► mean(x_high²)   ◄3         ├──► ...
+               ├──► mean(|x_high|)  ◄4         └──► bin 8  ◄14
+               └──► ZCR(x_high)     ◄5
+                                          9 frequency features
+               5 time-domain features
+
+  Per channel:  5 + 9 = 14 features
+  Per frame:    14 × 8 channels = 112 features
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │ One frame (112-dim vector):                                    │
+  │                                                                │
+  │ ┌── ch1 (14) ──┐ ┌── ch2 (14) ──┐     ┌── ch8 (14) ──┐     │
+  │ │ td td td td  │ │ td td td td  │ ... │ td td td td  │     │
+  │ │ td stft × 9  │ │ td stft × 9  │     │ td stft × 9  │     │
+  │ └──────────────┘ └──────────────┘     └──────────────┘     │
+  │  ◄──── 14 ─────►                        ◄──── 14 ─────►     │
+  │  ◄───────────────────── 112 total ──────────────────────►     │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Audio Target Features — 26 MFCCs
+
+```
+  Vocalized audio waveform (16,000 Hz)
+       │
+       ▼
+  For each 27ms frame with 10ms stride:
+       │
+       432 samples → Hamming window → FFT → power spectrum
+       │
+       ▼
+       128 Mel-scale triangular filter bank
+       │
+       ▼
+       log(filter outputs) → DCT → keep first 26 coefficients
+       │
+       ▼
+  One 26-dim MFCC vector per frame
+
+  MFCC 1:  overall loudness
+  MFCC 2:  spectral tilt (vowel identity)
+  MFCC 3+: increasingly fine spectral detail
+  MFCC 26: finest detail (speaker characteristics)
+
+  Output: (T, 26) at 100 Hz — same rate as EMG features
+```
+
+---
+
+## Session Embedding — 32 dimensions
+
+```
+  Problem: electrodes reattached between sessions → position shifts.
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  session_id = 13                                           │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  nn.Embedding(24 sessions, 32 dim)                        │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  [0.12, -0.34, 0.56, ..., 0.78]   ← 32-dim vector       │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  BROADCAST + CONCATENATE with EMG features:               │
+  │                                                            │
+  │  ┌───────────────────────────────────────────┐            │
+  │  │ Frame 0: [emg × 112 | session × 32] = 144│            │
+  │  │ Frame 1: [emg × 112 | session × 32] = 144│ same 32   │
+  │  │ ...                                       │ every     │
+  │  │ Frame T: [emg × 112 | session × 32] = 144│ frame     │
+  │  └───────────────────────────────────────────┘            │
+  │                                                            │
+  │  Model learns: "session 13 = electrode shifted 2mm up"    │
+  └────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Transducer — BiLSTM Architecture
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  Input: (batch, T, 144)  ← EMG (112) + session (32)            │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │ Dropout(0.5)           "before the first LSTM"           │   │
+  │  │      │                                                    │   │
+  │  │      ▼                                                    │   │
+  │  │ ┌────────────────────────────────────────────────────┐   │   │
+  │  │ │ BiLSTM Layer 1                                     │   │   │
+  │  │ │                                                     │   │   │
+  │  │ │ Forward:  h₁=f(x₁,h₀) → h₂=f(x₂,h₁) → ... → hₜ │   │   │
+  │  │ │           144 input → 1024 hidden                   │   │   │
+  │  │ │                                                     │   │   │
+  │  │ │ Backward: hₜ=f(xₜ,hₜ₊₁) → ... → h₁               │   │   │
+  │  │ │           144 input → 1024 hidden                   │   │   │
+  │  │ │                                                     │   │   │
+  │  │ │ Concat: 1024 + 1024 = 2048 per frame               │   │   │
+  │  │ └────────────────────────────────────────────────────┘   │   │
+  │  │      │                                                    │   │
+  │  │ Dropout(0.5)           "between all layers"              │   │
+  │  │      │                                                    │   │
+  │  │ ┌────────────────────────────────────────────────────┐   │   │
+  │  │ │ BiLSTM Layer 2                                     │   │   │
+  │  │ │ 2048 → 1024 fwd + 1024 bwd → 2048                 │   │   │
+  │  │ └────────────────────────────────────────────────────┘   │   │
+  │  │      │                                                    │   │
+  │  │ Dropout(0.5)                                              │   │
+  │  │      │                                                    │   │
+  │  │ ┌────────────────────────────────────────────────────┐   │   │
+  │  │ │ BiLSTM Layer 3                                     │   │   │
+  │  │ │ 2048 → 1024 fwd + 1024 bwd → 2048                 │   │   │
+  │  │ └────────────────────────────────────────────────────┘   │   │
+  │  │      │                                                    │   │
+  │  │ Dropout(0.5)           "after the last LSTM"             │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  Linear(2048 → 26)                                              │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  Output: (batch, T, 26)  ← predicted MFCCs                     │
+  │                                                                  │
+  │  ~60M parameters total                                           │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Audio Target Transfer — How silent EMG gets training labels
+
+```
+  THE PROBLEM: Silent EMG has NO audio. Need MFCC targets for MSE loss.
+
+  SOLUTION: Borrow MFCCs from vocalized recording via alignment.
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ PHASE 1 — Raw DTW                                               │
+  │                                                                  │
+  │ E'_S (313, 112)  ←→  E'_V (265, 112)                          │
+  │ silent features       vocalized features                        │
+  │                                                                  │
+  │ Cost: δ[i,j] = ‖E'_S[i] − E'_V[j]‖  (Euclidean)             │
+  │                                                                  │
+  │ DTW finds cheapest monotonic path:                              │
+  │                                                                  │
+  │      E'_V →                                                     │
+  │   E  ┌──────────────────────┐                                   │
+  │   '  │●─●                   │                                   │
+  │   S  │    ╲                 │  Path gives alignment[i] → j     │
+  │   │  │     ●─●             │  "silent frame i matches          │
+  │   ▼  │         ╲           │   vocalized frame j"              │
+  │      │          ●─●─●     │                                   │
+  │      │                ╲   │  Warp: Ã'_S[i] = A'_V[align[i]] │
+  │      │                 ●─●│                                   │
+  │      └──────────────────────┘                                   │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ PHASE 2 — CCA Refinement                                        │
+  │                                                                  │
+  │ Problem: silent EMG ≠ vocalized EMG (no voicing, different artic)│
+  │                                                                  │
+  │ CCA learns projections P_S, P_V (112 → 15 dim):               │
+  │   maximize correlation between P_S·E'_S and P_V·E'_V           │
+  │                                                                  │
+  │ New cost: δ_CCA[i,j] = ‖P_S·E'_S[i] − P_V·E'_V[j]‖         │
+  │                                                                  │
+  │ Re-run DTW → tighter alignment → better targets                │
+  └──────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ PHASE 3 — Predicted Audio Refinement (epoch 5+, every 5 epochs)│
+  │                                                                  │
+  │ Model now predicts rough MFCCs Â_S from silent EMG.             │
+  │                                                                  │
+  │ New cost: δ_full = δ_CCA + 10 × ‖Â_S[i] − A'_V[j]‖          │
+  │                           λ=10                                   │
+  │                                                                  │
+  │ "Does predicted audio match real audio?" → much better align    │
+  │                                                                  │
+  │ Every 5 epochs: re-align → new targets → resume training        │
+  │ Positive feedback: better model → better align → better model  │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## WaveNet Vocoder
+
+```
+  Trained SEPARATELY. Never sees EMG. Learns: MFCCs → natural speech.
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ CONDITIONING:                                                    │
+  │   Gold MFCCs (T, 26) @ 100 Hz                                  │
+  │     → BiLSTM(512, bidirectional) → (T, 1024)                   │
+  │     → Linear(1024 → 128)                                       │
+  │     → ConvTranspose1d (upsample ×160: 100Hz → 16kHz)           │
+  │                                                                  │
+  │ WAVENET CORE:                                                    │
+  │   16 dilated causal conv layers                                  │
+  │   Dilations: 1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128        │
+  │   Each layer: dilated_conv → tanh ⊗ sigmoid + conditioning     │
+  │              → skip (256) + residual (64)                       │
+  │   Output: softmax over 256 μ-law levels → next audio sample    │
+  │                                                                  │
+  │ AUTOREGRESSIVE: sample t depends on samples 0..t-1             │
+  │ 3-second utterance = 48,000 sequential forward passes          │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Results
+
+| Setting | Baseline | Paper 1 |
+|---|---|---|
+| Closed vocab (human) | 64.6% WER | **3.6%** WER |
+| Open vocab (ASR) | 88.0% WER | **68.0%** WER |
+| Open vocab (human) | 95.1% WER | **74.8%** WER |
 
 ---
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
 pip install -r requirements.txt
+python download_data.py
+python data/preprocessing.py --raw_dir ./data/raw/emg_data
+python train_transducer.py --gpu 0
+python train_transducer.py --gpu 0 --closed_vocab
+python train_wavenet.py --gpu 0
+python evaluate.py --audio_dir ./outputs --ref_file refs.json --asr whisper
 ```
-
-### 2. Download Data
-
-```bash
-python download_data.py --output_dir ./data/raw
-```
-
-Or manually from [Zenodo](https://doi.org/10.5281/zenodo.4064408).
-
-### 3. Preprocess
-
-```bash
-python main.py preprocess
-```
-
-This runs the full pipeline: raw EMG → filtered → 112-dim features at 100 Hz, raw audio → 26 MFCCs, then normalizes everything to zero mean / unit variance.
-
-### 4. Train
-
-```bash
-# Train the BiLSTM transducer (with target transfer alignment)
-python train_transducer.py --data_dir ./data/processed --gpu 0
-
-# Train the WaveNet decoder
-python train_wavenet.py --data_dir ./data/processed --gpu 0
-```
-
-Or run everything at once:
-
-```bash
-python main.py all --gpu 0
-```
-
-### 5. Inference
-
-```bash
-python inference.py \
-    --emg_path path/to/silent_emg.npy \
-    --transducer_ckpt ./checkpoints/best_transducer.pt \
-    --wavenet_ckpt ./checkpoints/wavenet/best_wavenet.pt \
-    --output_dir ./outputs
-```
-
-### 6. Evaluate
-
-```bash
-python evaluate.py \
-    --audio_dir ./outputs \
-    --ref_file references.json \
-    --asr whisper
-```
-
----
-
-## Paper ↔ Code Mapping
-
-| Paper Section | What | Code Location |
-|---|---|---|
-| §2.3 | EMG filtering (2Hz HP, 60Hz notch) | `features/emg_features.py :: preprocess_emg()` |
-| §3.1 | Time-domain + STFT features (112-dim) | `features/emg_features.py :: extract_emg_features()` |
-| §3.1 | 26 MFCCs at 100 Hz | `features/audio_features.py :: extract_mfcc()` |
-| §3.1 | Session embedding (32-dim) | `models/transducer.py :: SessionEmbedding` |
-| §3.1 | 3-layer BiLSTM (1024 hidden) | `models/transducer.py :: EMGTransducer` |
-| §3.2 | DTW alignment | `alignment/dtw.py :: dtw_alignment()` |
-| §3.2.1 | CCA refinement (15 components) | `alignment/cca.py :: CCAAligner` |
-| §3.2.2 | Predicted audio refinement (λ=10) | `alignment/target_transfer.py :: realign_with_audio()` |
-| §3.2.2 | Re-alignment schedule (warmup 4, every 5) | `alignment/target_transfer.py :: should_realign()` |
-| §3.3 | WaveNet (16 layers, dilation 128) | `models/wavenet.py :: WaveNet` |
-| §3.3 | Conditioning BiLSTM (512) + proj (128) | `models/wavenet.py :: ConditioningNetwork` |
-| App A | All WaveNet hyperparameters | `config.py :: WaveNetConfig` |
-| §4 | WER evaluation | `utils/evaluation.py :: word_error_rate()` |
-| §4.2.2 | ASR-based automatic eval | `utils/evaluation.py :: evaluate_model()` |
-
----
-
-## Key Hyperparameters
-
-| Parameter | Value | Source |
-|---|---|---|
-| EMG channels | 8 | Table 3 |
-| EMG sample rate | 1000 Hz | §2.3 |
-| Audio sample rate | 16 kHz | §2.3 |
-| Feature frame length | 27 ms | §3.1 |
-| Feature stride | 10 ms (→ 100 Hz) | §3.1 |
-| EMG features per frame | 112 (14 × 8) | §3.1 |
-| MFCC dimension | 26 | §3.1 |
-| Session embedding dim | 32 | §3.1 |
-| LSTM hidden | 1024 | §3.1 |
-| LSTM layers | 3 (bidirectional) | §3.1 |
-| Dropout | 0.5 | §3.1 |
-| Learning rate | 0.001 | §3.1 |
-| LR decay | ×0.5 after 5 epochs no improvement | §3.1 |
-| CCA components | 15 | §3.2.1 |
-| λ (audio alignment weight) | 10.0 | §3.2.2 |
-| WaveNet layers | 16 | App A |
-| WaveNet max dilation | 128 | App A |
-| WaveNet residual channels | 64 | App A |
-| WaveNet skip channels | 256 | App A |
-| WaveNet conditioning dim | 128 | App A |
-| μ-law quantization levels | 256 | App A |
-
----
-
-## Expected Results
-
-| Setting | Metric | Baseline | Our Model |
-|---|---|---|---|
-| Closed vocab (human) | WER | 64.6% | **3.6%** |
-| Open vocab (human) | WER | 95.1% | **74.8%** |
-| Open vocab (ASR) | WER | 88.0% | **68.0%** |
-| Open vocab (no CCA) | WER | — | 69.8% |
-| Open vocab (no audio align) | WER | — | 76.5% |
-
-*From Tables 4 and 5 in the paper.*
-
----
-
-## Testing
-
-```bash
-pytest tests/test_all.py -v
-```
-
-Tests cover: feature extraction shapes, DTW monotonicity, CCA projections, model forward passes, WER computation, and the full integration pipeline.
-
----
-
-## Citation
-
-```bibtex
-@inproceedings{gaddy2020digital,
-  title={Digital Voicing of Silent Speech},
-  author={Gaddy, David and Klein, Dan},
-  booktitle={Proceedings of EMNLP},
-  year={2020}
-}
-```
-
----
-
-## License
-
-This is a research reimplementation. The original dataset is available under the terms specified at [Zenodo](https://doi.org/10.5281/zenodo.4064408).
